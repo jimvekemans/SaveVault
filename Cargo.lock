@@ -2505,6 +2505,7 @@ dependencies = [
  "flate2",
  "globset",
  "hostname",
+ "libc",
  "rfd",
  "serde",
  "serde_json",

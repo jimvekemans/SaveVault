@@ -32,6 +32,8 @@ GENERAL:
 DETECTION:
         --scan                        Find installed games and their save locations, and track them
         --detect                      Same as --scan but only prints what it would do
+        --protect <GAME_OR_PROVIDER>  Track matching scanned game(s) (e.g. 'retroarch' or 'elden')
+        --launch <GAME>               Launch a RetroArch game directly with its KBM profile
         --update-db                   Download / refresh the save location database now
         --import-db <manifest.yaml>   Build the save location database from a local manifest file
 
@@ -341,6 +343,35 @@ fn run_cli(args: &[String]) -> Result<bool> {
         "--status" => print_status()?,
         "--scan" => run_scan(false)?,
         "--detect" => run_scan(true)?,
+        "--protect" => {
+            let needle = arg(args, 1, "game or provider")?.to_lowercase();
+            let (config_path, mut cfg) = load()?;
+            let db = load_db();
+            let scanned = scan_installed_games(&cfg.provider_libraries, db.as_ref(), cfg.include_config_roots);
+            let mut added = Vec::new();
+            for (g, _) in scanned {
+                let matches = g.id.to_lowercase().contains(&needle)
+                    || g.name.to_lowercase().contains(&needle)
+                    || g.provider.slug() == needle;
+                if matches {
+                    if !cfg.games.iter().any(|e| e.id == g.id) {
+                        cfg.ignored_game_ids.retain(|id| id != &g.id);
+                        added.push(g.id.clone());
+                        cfg.games.push(g);
+                    }
+                }
+            }
+            save_config(&config_path, &cfg)?;
+            println!("Protected {} matching game(s): {}", added.len(), added.join(", "));
+        }
+        "--launch" => {
+            let needle = arg(args, 1, "game")?;
+            let (config_path, cfg) = load()?;
+            let id = find_game_id(&cfg, needle)?;
+            let game = cfg.games.iter().find(|g| g.id == id).context("game vanished")?;
+            let pid = save_game_manager::retroarch::launch_retroarch_game(&config_path, &cfg, game)?;
+            println!("Launched {} in RetroArch (PID {pid}).", game.name);
+        }
         "--update-db" => match update_database(&default_db_dir(), true)? {
             UpdateOutcome::Updated { games } => println!("Save location database updated: {games} games."),
             UpdateOutcome::NotModified | UpdateOutcome::Fresh => println!("Save location database is already current."),

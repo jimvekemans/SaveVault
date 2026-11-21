@@ -102,6 +102,16 @@ pub fn default_library_paths(provider: Provider, platform: Platform, home: &Path
             home.join(".local/share/bottles/bottles"),
             home.join(".var/app/com.usebottles.bottles/data/bottles/bottles"),
         ],
+        (Provider::RetroArch, Platform::Linux) => vec![
+            home.join(".config/retroarch"),
+            home.join(".var/app/org.libretro.RetroArch/config/retroarch"),
+        ],
+        (Provider::RetroArch, Platform::MacOs) => vec![
+            home.join("Library/Application Support/RetroArch"),
+        ],
+        (Provider::RetroArch, Platform::Windows) => vec![
+            PathBuf::from(r"C:\RetroArch-Win64"),
+        ],
         (Provider::Other, Platform::Linux) => vec![
             home.join(".config/heroic/sideload_apps"),
             home.join(".var/app/com.heroicgameslauncher.hgl/config/heroic/sideload_apps"),
@@ -138,6 +148,7 @@ pub fn scan_provider_libraries(libraries: &[ProviderLibraryConfig]) -> Vec<GameE
             Provider::Amazon => scan_amazon_paths(&lib.library_paths),
             Provider::Lutris => scan_lutris_paths(&lib.library_paths),
             Provider::Bottles => scan_bottles_paths(&lib.library_paths),
+            Provider::RetroArch => crate::retroarch::scan_retroarch_paths(&lib.library_paths),
             Provider::Other => scan_sideload_paths(&lib.library_paths),
         };
         for entry in entries {

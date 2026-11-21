@@ -7,8 +7,11 @@
 mod editor;
 mod games;
 mod import;
+mod kbm_ui;
 mod logs;
 mod settings;
+
+use kbm_ui::{KbmRebindScope, KbmRebindState, render_kbm_profile_editor};
 
 use crate::auth::{
     RepoEnsureResult, ensure_remote_repo_exists, generate_ssh_keypair, public_key_path_for,
@@ -94,6 +97,7 @@ enum SettingsHighlight {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DetailTab {
     Overview,
+    Controls,
     Timeline,
     Profiles,
     Folders,
@@ -345,6 +349,11 @@ pub struct SaveGameManagerApp {
     profile_cache: Option<(String, Vec<ProfileSummary>)>,
     safety_cache: Option<(String, Vec<SafetyBackup>)>,
     mods_cache: Option<(String, Option<usize>)>,
+    save_states_cache: Option<(String, Vec<PathBuf>)>,
+    kbm_rebind: Option<KbmRebindState>,
+    kbm_dirty_game_id: Option<String>,
+    kbm_dirty_default: bool,
+    kbm_last_live_sync: Instant,
     add_root_kind: RootKind,
     exclude_buffer: Option<(String, String)>,
     suggestions: HashMap<String, Detection>,
@@ -554,6 +563,11 @@ impl SaveGameManagerApp {
             profile_cache: None,
             safety_cache: None,
             mods_cache: None,
+            save_states_cache: None,
+            kbm_rebind: None,
+            kbm_dirty_game_id: None,
+            kbm_dirty_default: false,
+            kbm_last_live_sync: Instant::now() - Duration::from_secs(1),
             add_root_kind: RootKind::Saves,
             exclude_buffer: None,
             suggestions: HashMap::new(),
@@ -614,6 +628,7 @@ impl SaveGameManagerApp {
                     _ => AppTab::Games,
                 };
                 app.detail_tab = match parts.next().unwrap_or("") {
+                    "controls" | "kbm" => DetailTab::Controls,
                     "timeline" => DetailTab::Timeline,
                     "profiles" => DetailTab::Profiles,
                     "folders" => DetailTab::Folders,
@@ -666,11 +681,54 @@ impl SaveGameManagerApp {
     fn persist_config(&mut self) {
         if let Err(err) = save_config(&self.config_path, &self.config) {
             self.set_status(format!("Failed to save settings: {err}"), true);
+        } else {
+            let _ = crate::retroarch::sync_kbm_registry_for_config(&self.config_path, &self.config);
         }
         if let Some(w) = &self.watcher {
             w.update_config(&self.config);
         }
         self.refresh_cloud_facts();
+    }
+
+    fn preview_live_kbm_game(&mut self, game_id: &str) {
+        self.kbm_dirty_game_id = Some(game_id.to_string());
+        if self.kbm_last_live_sync.elapsed() >= Duration::from_millis(150) {
+            self.kbm_last_live_sync = Instant::now();
+            let _ = crate::retroarch::sync_kbm_registry_for_config(&self.config_path, &self.config);
+        }
+    }
+
+    fn commit_kbm_game(&mut self, game_id: &str, ensure_bridge: bool) {
+        if self.kbm_dirty_game_id.as_deref() == Some(game_id) {
+            self.kbm_dirty_game_id = None;
+        }
+        if let Some(game) = self.config.games.iter().find(|g| g.id == game_id).cloned()
+            && let Err(err) = crate::retroarch::apply_kbm_profile_to_retroarch(&game)
+        {
+            self.set_status(format!("Saved in app, but RetroArch .cfg failed: {err}"), true);
+        }
+        self.persist_config();
+        if ensure_bridge {
+            let reg_path = crate::retroarch::kbm_profiles_path_for(&self.config_path);
+            crate::retroarch::ensure_mkb_bridge_running(&reg_path);
+        }
+    }
+
+    fn launch_retroarch_game_action(&mut self, game_id: &str) {
+        let Some(game) = self.config.games.iter().find(|g| g.id == game_id).cloned() else {
+            return;
+        };
+        match crate::retroarch::launch_retroarch_game(&self.config_path, &self.config, &game) {
+            Ok(pid) => {
+                self.set_status(
+                    format!("Launched {} in RetroArch (PID {pid}).", game.name),
+                    false,
+                );
+            }
+            Err(err) => {
+                self.set_status(format!("Failed to launch {}: {err:#}", game.name), true);
+            }
+        }
     }
 
     fn push_log(&mut self, level: LogLevel, source: impl Into<String>, message: impl Into<String>) {
@@ -783,6 +841,7 @@ impl SaveGameManagerApp {
         self.profile_cache = None;
         self.safety_cache = None;
         self.mods_cache = None;
+        self.save_states_cache = None;
         self.cached_files_for_game = None;
     }
 
@@ -790,6 +849,7 @@ impl SaveGameManagerApp {
         if self.selected_game_id.as_deref() != Some(id.as_str()) {
             self.selected_game_id = Some(id);
             self.invalidate_game_caches();
+            self.kbm_rebind = None;
             self.editing_label_commit = None;
             self.renaming_profile = None;
             self.exclude_buffer = None;
@@ -2068,6 +2128,15 @@ impl eframe::App for SaveGameManagerApp {
 
         self.render_remove_game_prompt(&ctx, &pal);
         self.render_restore_dialog(&ctx, &pal);
+        if !ctx.input(|i| i.pointer.any_down()) {
+            if let Some(dirty_id) = self.kbm_dirty_game_id.take() {
+                self.commit_kbm_game(&dirty_id, false);
+            }
+            if self.kbm_dirty_default {
+                self.kbm_dirty_default = false;
+                self.persist_config();
+            }
+        }
         self.service_capture(&ctx);
     }
 }

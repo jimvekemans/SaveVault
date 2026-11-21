@@ -316,6 +316,9 @@ impl SaveGameManagerApp {
                 });
 
                 ui.add_space(8.0);
+                self.render_retroarch_default_kbm_settings(ui, pal, &mut changed);
+
+                ui.add_space(8.0);
                 self.render_protection_settings(ui, pal, &mut changed);
 
                 ui.add_space(8.0);
@@ -948,6 +951,70 @@ impl SaveGameManagerApp {
         if let Some((msg, is_err)) = pending_status {
             self.set_status(msg, is_err);
         }
+    }
+
+    pub(super) fn render_retroarch_default_kbm_settings(
+        &mut self,
+        ui: &mut egui::Ui,
+        pal: &JizihubPalette,
+        changed: &mut bool,
+    ) {
+        glass_frame_1(pal).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("RetroArch Launcher & Default KBM Override Template");
+                render_badge(ui, pal, "NEW GAMES", false);
+            });
+            ui.small(
+                egui::RichText::new(
+                    "Default Mouse & Keyboard settings applied automatically when you enable KBM overrides on a new RetroArch game.",
+                )
+                .color(pal.text_3),
+            );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("RetroArch binary / command:");
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.config.retroarch_binary)
+                            .desired_width((ui.available_width() - 120.0).max(180.0)),
+                    )
+                    .changed()
+                {
+                    *changed = true;
+                }
+                if ui.button("Reset").clicked() {
+                    self.config.retroarch_binary = crate::models::default_retroarch_binary();
+                    *changed = true;
+                }
+            });
+
+            ui.add_space(4.0);
+            egui::CollapsingHeader::new("Default KBM Override Settings (Sensitivity & Keybindings)")
+                .id_salt("default_kbm_template_header")
+                .default_open(false)
+                .show(ui, |ui| {
+                    if ui.button("Reset Template to FPS Defaults").clicked() {
+                        self.config.default_kbm_profile = crate::models::KbmProfile::default();
+                        *changed = true;
+                    }
+                    let kbm_outcome = render_kbm_profile_editor(
+                        ui,
+                        pal,
+                        "default_kbm_template",
+                        None,
+                        KbmRebindScope::DefaultTemplate,
+                        &mut self.config.default_kbm_profile,
+                        &mut self.kbm_rebind,
+                    );
+                    if kbm_outcome.commit {
+                        self.kbm_dirty_default = false;
+                        *changed = true;
+                    } else if kbm_outcome.changed {
+                        self.kbm_dirty_default = true;
+                    }
+                });
+        });
     }
 
     pub(super) fn render_protection_settings(&mut self, ui: &mut egui::Ui, pal: &JizihubPalette, changed: &mut bool) {

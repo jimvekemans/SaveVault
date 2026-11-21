@@ -1110,4 +1110,113 @@ fn test_remove_game_keep_or_delete_git_folder() {
     assert!(manifest.games.iter().all(|g| g.id != "gog:game_b"));
 }
 
+#[test]
+fn test_retroarch_platform_save_states_and_kbm_profiles() {
+    use save_game_manager::models::{KbmAction, RetroArchHotkey};
+    use save_game_manager::retroarch::{
+        apply_kbm_profile_to_retroarch, ensure_playlist_item, load_kbm_profiles_registry,
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let ra_dir = tmp.path().join("retroarch");
+    let roms_ps2 = tmp.path().join("ROMs/ps2");
+    fs::create_dir_all(ra_dir.join("saves/ParaLLEl PS2")).unwrap();
+    fs::create_dir_all(ra_dir.join("states/ParaLLEl PS2")).unwrap();
+    fs::create_dir_all(ra_dir.join("config/ParaLLEl PS2")).unwrap();
+    fs::create_dir_all(&roms_ps2).unwrap();
+
+    let black_iso = roms_ps2.join("Black (Europe) (En,Fr,De,Es,It).iso");
+    fs::write(&black_iso, b"black-iso-data").unwrap();
+    let black_ps2 = ra_dir.join("saves/ParaLLEl PS2/Black (Europe) (En,Fr,De,Es,It).ps2");
+    let shared_mc = ra_dir.join("saves/ParaLLEl PS2/Mcd001.ps2");
+    fs::write(&black_ps2, b"black-save-v1").unwrap();
+    fs::write(&shared_mc, b"shared-memcard").unwrap();
+    let state0 = ra_dir.join("states/ParaLLEl PS2/Black (Europe) (En,Fr,De,Es,It).state");
+    fs::write(&state0, b"savestate-v1").unwrap();
+
+    ensure_playlist_item(
+        &ra_dir.join("playlists/Sony - PlayStation 2.lpl"),
+        &black_iso,
+        "Black (Europe)",
+        Path::new("/usr/lib/libretro/pcsx2_libretro.so"),
+        "Sony - PlayStation 2 (LRPS2)",
+        None,
+    )
+    .unwrap();
+
+    let discovered = scan_provider_libraries(&[ProviderLibraryConfig {
+        provider: Provider::RetroArch,
+        library_paths: vec![ra_dir.clone(), tmp.path().join("ROMs")],
+        enabled: true,
+    }]);
+    assert_eq!(discovered.len(), 1);
+    let mut black = discovered[0].clone();
+    assert_eq!(black.provider, Provider::RetroArch);
+    assert_eq!(black.id, "retroarch:black_europe");
+
+    // Customize per-game KBM settings and verify .cfg + registry roundtrip.
+    {
+        let meta = black.retroarch.as_mut().unwrap();
+        meta.kbm_enabled = true;
+        meta.kbm_profile.mouse_sensitivity = 1750.0;
+        meta.kbm_profile
+            .set_binding(KbmAction::SprintL3, 0, "F".to_string());
+        meta.kbm_profile
+            .set_hotkey(RetroArchHotkey::FastForwardToggle, 0, "LCtrl+Space".to_string());
+    }
+    let cfg_written = apply_kbm_profile_to_retroarch(&black).unwrap().unwrap();
+    let cfg_txt = fs::read_to_string(&cfg_written).unwrap();
+    assert!(cfg_txt.contains("input_player1_l3 = \"f\""));
+    assert!(cfg_txt.contains("input_toggle_fast_forward_btn = \"13\""));
+
+    let mut cfg = make_test_config(tmp.path());
+    cfg.default_kbm_profile.mouse_sensitivity = 1400.0;
+    cfg.games.push(black);
+    let cfg_path = tmp.path().join("save_game_manager/config.json");
+    save_config(&cfg_path, &cfg).unwrap();
+    save_game_manager::retroarch::sync_kbm_registry_for_config(&cfg_path, &cfg).unwrap();
+
+    let reg = load_kbm_profiles_registry(&tmp.path().join("save_game_manager/retroarch_kbm_profiles.json"));
+    assert_eq!(reg.default_profile.mouse_sensitivity, 1400.0);
+    assert_eq!(reg.games.len(), 1);
+    assert_eq!(reg.games[0].profile.mouse_sensitivity, 1750.0);
+    assert_eq!(
+        reg.games[0]
+            .profile
+            .hotkey(RetroArchHotkey::FastForwardToggle, 0),
+        "LCtrl+Space"
+    );
+
+    // Verify per-ROM save filtering & save states snapshot + rollback without clobbering Mcd001.ps2.
+    let v1 = sync_game_in_config(&mut cfg, "retroarch:black_europe", false)
+        .unwrap()
+        .committed_sha
+        .unwrap();
+    use save_game_manager::git_ops::ROOTS_DIR;
+    assert!(
+        cfg.local_repo_path
+            .join("retroarch/black_europe/Black (Europe) (En,Fr,De,Es,It).ps2")
+            .is_file()
+    );
+    assert!(!cfg.local_repo_path.join("retroarch/black_europe/Mcd001.ps2").exists());
+    assert!(
+        cfg.local_repo_path
+            .join("retroarch/black_europe")
+            .join(ROOTS_DIR)
+            .join("savestates/Black (Europe) (En,Fr,De,Es,It).state")
+            .is_file()
+    );
+
+    fs::write(&black_ps2, b"black-save-v2").unwrap();
+    fs::write(&shared_mc, b"other-game-memcard-edit").unwrap();
+    fs::write(&state0, b"savestate-v2").unwrap();
+    sync_game_in_config(&mut cfg, "retroarch:black_europe", false).unwrap();
+
+    rollback_game_to_commit(&mut cfg, "retroarch:black_europe", &v1, false).unwrap();
+    assert_eq!(fs::read(&black_ps2).unwrap(), b"black-save-v1");
+    assert_eq!(fs::read(&state0).unwrap(), b"savestate-v1");
+    assert_eq!(fs::read(&shared_mc).unwrap(), b"other-game-memcard-edit");
+}
+
+
 

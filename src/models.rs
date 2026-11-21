@@ -1,3 +1,7 @@
+pub use crate::kbm::keys::{
+    KbmAction, KbmProfile, RetroArchGameMeta, RetroArchHotkey, default_kbm_bindings,
+    default_kbm_hotkeys, default_mouse_deadzone, default_mouse_dpi, default_mouse_sensitivity,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -11,6 +15,7 @@ pub enum Provider {
     Amazon,
     Lutris,
     Bottles,
+    RetroArch,
     /// Standalone installs, sideloaded Heroic apps, non-Steam shortcuts, emulators, and
     /// anything the user added by hand.
     #[default]
@@ -27,6 +32,7 @@ impl Provider {
             Provider::Amazon => "amazon",
             Provider::Lutris => "lutris",
             Provider::Bottles => "bottles",
+            Provider::RetroArch => "retroarch",
             Provider::Other => "other",
         }
     }
@@ -40,6 +46,7 @@ impl Provider {
             Provider::Amazon => "Amazon Games",
             Provider::Lutris => "Lutris",
             Provider::Bottles => "Bottles",
+            Provider::RetroArch => "RetroArch",
             Provider::Other => "Other",
         }
     }
@@ -53,6 +60,7 @@ impl Provider {
             Provider::Amazon,
             Provider::Lutris,
             Provider::Bottles,
+            Provider::RetroArch,
             Provider::Other,
         ]
     }
@@ -63,7 +71,11 @@ impl Provider {
             Provider::Steam => Some("steam"),
             Provider::Gog => Some("gog"),
             Provider::EpicGames => Some("epic"),
-            Provider::Amazon | Provider::Lutris | Provider::Bottles | Provider::Other => None,
+            Provider::Amazon
+            | Provider::Lutris
+            | Provider::Bottles
+            | Provider::RetroArch
+            | Provider::Other => None,
         }
     }
 }
@@ -407,6 +419,9 @@ pub struct GameEntry {
     /// Per-game override for "snapshot when the game closes" (`None` = follow global setting).
     #[serde(default)]
     pub backup_on_exit: Option<bool>,
+    /// RetroArch launcher, core, save-state, and per-game Mouse & Keyboard override settings.
+    #[serde(default)]
+    pub retroarch: Option<RetroArchGameMeta>,
 }
 
 impl Default for GameEntry {
@@ -438,6 +453,7 @@ impl Default for GameEntry {
             mod_sources: Vec::new(),
             sync_state: GameSyncState::default(),
             backup_on_exit: None,
+            retroarch: None,
         }
     }
 }
@@ -786,10 +802,20 @@ pub struct AppConfig {
     /// Games the user removed or declined; scans do not add them again.
     #[serde(default)]
     pub ignored_game_ids: Vec<String>,
+    /// Default Mouse & Keyboard override settings seeded when enabling KBM on a new game.
+    #[serde(default)]
+    pub default_kbm_profile: KbmProfile,
+    /// RetroArch binary name or full path used by the RetroArch game launcher.
+    #[serde(default = "default_retroarch_binary")]
+    pub retroarch_binary: String,
 }
 
 fn default_safety_keep() -> u32 {
     10
+}
+
+pub fn default_retroarch_binary() -> String {
+    "retroarch".to_string()
 }
 
 impl AppConfig {

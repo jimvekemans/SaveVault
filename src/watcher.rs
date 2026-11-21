@@ -18,6 +18,8 @@ pub struct GameProbe {
     pub steam_app_id: Option<String>,
     /// Install folder with forward slashes and no trailing slash.
     pub install_dir: Option<String>,
+    /// Full path to a RetroArch ROM file when launched via `retroarch -L <core> <rom>`.
+    pub retroarch_rom: Option<String>,
 }
 
 fn normalize(path: &str) -> String {
@@ -29,6 +31,14 @@ pub fn probes_for(games: &[GameEntry]) -> Vec<GameProbe> {
     games
         .iter()
         .filter_map(|g| {
+            let retroarch_rom = (g.provider == Provider::RetroArch)
+                .then(|| {
+                    g.retroarch
+                        .as_ref()
+                        .map(|r| normalize(&r.rom_path.to_string_lossy()))
+                })
+                .flatten()
+                .filter(|p| !p.is_empty());
             let install_dir = g
                 .install_dir
                 .as_deref()
@@ -38,13 +48,14 @@ pub fn probes_for(games: &[GameEntry]) -> Vec<GameProbe> {
                 .then(|| g.app_id.clone())
                 .flatten()
                 .filter(|id| !id.is_empty());
-            if install_dir.is_none() && steam_app_id.is_none() {
+            if install_dir.is_none() && steam_app_id.is_none() && retroarch_rom.is_none() {
                 return None;
             }
             Some(GameProbe {
                 id: g.id.clone(),
                 steam_app_id,
                 install_dir,
+                retroarch_rom,
             })
         })
         .collect()
@@ -71,6 +82,14 @@ fn strip_drive(arg: &str) -> &str {
 }
 
 fn process_matches(probe: &GameProbe, args: &[String]) -> bool {
+    if let Some(rom) = &probe.retroarch_rom {
+        let exe_is_ra = args
+            .first()
+            .is_some_and(|a| crate::retroarch::is_retroarch_executable_name(a));
+        if exe_is_ra && args.iter().skip(1).any(|a| normalize(a) == *rom) {
+            return true;
+        }
+    }
     if let Some(app_id) = &probe.steam_app_id {
         let needle = format!("AppId={app_id}");
         if args.iter().any(|a| a == &needle) {
@@ -323,7 +342,30 @@ mod tests {
             id: id.into(),
             steam_app_id: app.map(str::to_string),
             install_dir: dir.map(str::to_string),
+            retroarch_rom: None,
         }
+    }
+
+    #[test]
+    fn recognises_retroarch_rom_processes() {
+        let probes = vec![GameProbe {
+            id: "retroarch:black_europe".into(),
+            steam_app_id: None,
+            install_dir: Some("/home/u/Games/ROMs/ps2".into()),
+            retroarch_rom: Some("/home/u/Games/ROMs/ps2/Black (Europe).iso".into()),
+        }];
+        let procs = vec![
+            args(&[
+                "/usr/bin/retroarch",
+                "-L",
+                "/usr/lib/libretro/pcsx2_libretro.so",
+                "/home/u/Games/ROMs/ps2/Black (Europe).iso",
+            ]),
+            args(&["/usr/bin/dolphin", "/home/u/Games/ROMs/ps2"]),
+        ];
+        let running = running_games(&probes, &procs);
+        assert_eq!(running.len(), 1);
+        assert!(running.contains("retroarch:black_europe"));
     }
 
     fn args(a: &[&str]) -> Vec<String> {

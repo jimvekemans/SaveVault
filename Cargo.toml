@@ -4,6 +4,14 @@ version = "0.2.0"
 edition = "2024"
 description = "SaveVault: automatic game save detection, snapshots, profiles, rollback and two-way sync backed by a private git repository."
 
+[[bin]]
+name = "save_game_manager"
+path = "src/main.rs"
+
+[[bin]]
+name = "retroarch-mkb-bridge"
+path = "src/bin/retroarch_mkb_bridge.rs"
+
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"
@@ -24,3 +32,6 @@ tempfile = "3.27"
 ureq = { version = "3.5", features = ["json"] }
 walkdir = "2.5"
 zip = { version = "9.6.0", default-features = false, features = ["deflate"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

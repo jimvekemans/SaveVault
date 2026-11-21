@@ -1,6 +1,6 @@
 use crate::models::{
-    AppConfig, AuthMethod, CONFIG_SCHEMA_VERSION, ConflictPolicy, Platform, Provider, SyncRate,
-    ThemeMode,
+    AppConfig, AuthMethod, CONFIG_SCHEMA_VERSION, ConflictPolicy, KbmProfile, Platform, Provider,
+    SyncRate, ThemeMode, default_retroarch_binary,
 };
 use crate::providers::{default_provider_libraries, scan_provider_libraries};
 use anyhow::{Context, Result};
@@ -57,6 +57,8 @@ pub fn default_config() -> AppConfig {
         onboarding_done: false,
         custom_remote_url: None,
         ignored_game_ids: Vec::new(),
+        default_kbm_profile: KbmProfile::default(),
+        retroarch_binary: default_retroarch_binary(),
     }
 }
 

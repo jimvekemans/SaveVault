@@ -71,6 +71,12 @@ mkdir -p \
 
 echo "==> Staging SaveVault.AppDir from ${RELEASE_BIN}..."
 install -m 755 "${RELEASE_BIN}" "${APPDIR}/usr/bin/save_game_manager"
+BRIDGE_BIN="${PROJECT_DIR}/target/release/retroarch-mkb-bridge"
+if [[ ! -x "${BRIDGE_BIN}" ]]; then
+    echo "Error: release bridge binary not found or not executable at ${BRIDGE_BIN}. Re-run without --skip-cargo-build." >&2
+    exit 1
+fi
+install -m 755 "${BRIDGE_BIN}" "${APPDIR}/usr/bin/retroarch-mkb-bridge"
 
 ICON_SRC="${PROJECT_DIR}/assets/savevault.svg"
 if [[ ! -f "${ICON_SRC}" ]]; then

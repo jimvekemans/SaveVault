@@ -2,6 +2,16 @@ use super::*;
 
 enum GameAction {
     Sync(Option<String>),
+    LaunchRetroArch,
+    AttachRetroArchRom,
+    UpdateRetroArchMeta {
+        meta: Box<crate::models::RetroArchGameMeta>,
+        commit: bool,
+        ensure_bridge: bool,
+        status_note: Option<String>,
+    },
+    SaveDefaultKbmTemplate(Box<crate::models::KbmProfile>),
+    OpenControlsTab,
     OpenFolder(PathBuf),
     OpenEditor(PathBuf),
     ApplySuggestion,
@@ -531,15 +541,39 @@ impl SaveGameManagerApp {
             if !game.profiles.is_empty() {
                 render_badge(ui, pal, &format!("Profile: {}", game.profile_name(&game.active_profile)), true);
             }
+            if let Some(meta) = &game.retroarch {
+                if meta.kbm_enabled {
+                    render_badge(ui, pal, "KBM OVERRIDE", true);
+                }
+                if accent_button(ui, pal, !self.busy, "Launch in RetroArch").clicked() {
+                    actions.push(GameAction::LaunchRetroArch);
+                }
+            }
         });
+        let has_retroarch = game.provider == Provider::RetroArch || game.retroarch.is_some();
+        if !has_retroarch && self.detail_tab == DetailTab::Controls {
+            self.detail_tab = DetailTab::Overview;
+        }
         ui.horizontal(|ui| {
-            for (tab, label) in [
-                (DetailTab::Overview, "Overview".to_string()),
+            let mut tabs = vec![(DetailTab::Overview, "Overview".to_string())];
+            if has_retroarch {
+                let kbm_on = game.retroarch.as_ref().is_some_and(|m| m.kbm_enabled);
+                tabs.push((
+                    DetailTab::Controls,
+                    if kbm_on {
+                        "Controls & KBM (On)".to_string()
+                    } else {
+                        "Controls & KBM".to_string()
+                    },
+                ));
+            }
+            tabs.extend([
                 (DetailTab::Timeline, "Timeline".to_string()),
                 (DetailTab::Profiles, format!("Profiles ({})", game.profiles.len() + 1)),
                 (DetailTab::Folders, "Folders & Mods".to_string()),
                 (DetailTab::Advanced, "More".to_string()),
-            ] {
+            ]);
+            for (tab, label) in tabs {
                 ui.selectable_value(&mut self.detail_tab, tab, label);
             }
         });
@@ -551,6 +585,7 @@ impl SaveGameManagerApp {
             .max_height(ui.available_height().max(160.0))
             .show(ui, |ui| match self.detail_tab {
                 DetailTab::Overview => self.detail_overview(ui, pal, &game, &health, &mut actions),
+                DetailTab::Controls => self.detail_controls(ui, pal, &game, &mut actions),
                 DetailTab::Timeline => self.detail_timeline(ui, pal, &game, &mut actions),
                 DetailTab::Profiles => self.detail_profiles(ui, pal, &game, &mut actions),
                 DetailTab::Folders => self.detail_folders(ui, pal, &game, &mut actions),
@@ -594,6 +629,75 @@ impl SaveGameManagerApp {
                 self.sync_label_input.clear();
                 self.start_sync(vec![id], label, format!("Back up {}", game.name), false);
             }
+            GameAction::LaunchRetroArch => self.launch_retroarch_game_action(&id),
+            GameAction::AttachRetroArchRom => {
+                if let Some(rom) = rfd::FileDialog::new().pick_file() {
+                    let ra_root = game.library_root.clone();
+                    let (core_path, core_name, sys_name) =
+                        crate::retroarch::resolve_core_for_rom_with_root(
+                            ra_root.as_deref(),
+                            None,
+                            None,
+                            &rom,
+                        )
+                        .unwrap_or_else(|| {
+                            (
+                                crate::retroarch::find_core_library(
+                                    ra_root.as_deref(),
+                                    "pcsx2_libretro",
+                                ),
+                                "ParaLLEl PS2".to_string(),
+                                "RetroArch".to_string(),
+                            )
+                        });
+                    let new_meta = crate::models::RetroArchGameMeta {
+                        rom_path: rom,
+                        core_path,
+                        core_name,
+                        playlist_name: None,
+                        system_name: Some(sys_name),
+                        kbm_enabled: false,
+                        kbm_profile: self.config.default_kbm_profile.clone(),
+                        kbm_customized: false,
+                    };
+                    let include_cfg = self.config.include_config_roots;
+                    let db = self.db.clone();
+                    self.with_game_mut(&id, |g| {
+                        g.retroarch = Some(new_meta);
+                        if g.save_dir.as_os_str().is_empty() {
+                            let det = crate::detect::detect_game(g, db.as_deref());
+                            crate::detect::apply_detection(g, &det, include_cfg);
+                        }
+                    });
+                }
+            }
+            GameAction::UpdateRetroArchMeta {
+                meta,
+                commit,
+                ensure_bridge,
+                status_note,
+            } => {
+                if let Some(g) = self.config.games.iter_mut().find(|g| g.id == id) {
+                    g.retroarch = Some(*meta);
+                }
+                if commit {
+                    self.commit_kbm_game(&id, ensure_bridge);
+                } else {
+                    self.preview_live_kbm_game(&id);
+                }
+                if let Some(msg) = status_note {
+                    self.set_status(msg, false);
+                }
+            }
+            GameAction::SaveDefaultKbmTemplate(profile) => {
+                self.config.default_kbm_profile = *profile;
+                self.persist_config();
+                self.set_status(
+                    "Updated global Default KBM Override settings for new games.",
+                    false,
+                );
+            }
+            GameAction::OpenControlsTab => self.detail_tab = DetailTab::Controls,
             GameAction::OpenFolder(path) => open_folder(&path),
             GameAction::OpenEditor(path) => self.open_file_in_editor(&path),
             GameAction::ApplySuggestion => {
@@ -852,6 +956,85 @@ impl SaveGameManagerApp {
         }
         ui.add_space(8.0);
 
+        if let Some(meta) = &game.retroarch {
+            if self.save_states_cache.as_ref().map(|(id, _)| id.as_str()) != Some(game.id.as_str())
+            {
+                let states = crate::retroarch::list_retroarch_save_states(game);
+                self.save_states_cache = Some((game.id.clone(), states));
+            }
+            let state_files = self
+                .save_states_cache
+                .as_ref()
+                .map(|(_, s)| s.clone())
+                .unwrap_or_default();
+
+            glass_frame_2(pal).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    render_badge(ui, pal, "RETROARCH LAUNCHER", true);
+                    ui.strong(format!("Core: {}", meta.core_name));
+                    if let Some(sys) = &meta.system_name {
+                        ui.label(egui::RichText::new(sys).small().color(pal.text_3));
+                    }
+                    if meta.kbm_enabled {
+                        render_badge(
+                            ui,
+                            pal,
+                            &format!("KBM ON ({:.0}x)", meta.kbm_profile.mouse_sensitivity),
+                            true,
+                        );
+                    } else {
+                        render_badge(ui, pal, "GAMEPAD MODE", false);
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(format!("ROM: {}", meta.rom_path.display()))
+                        .monospace()
+                        .small()
+                        .color(pal.text_2),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    if accent_button(ui, pal, !self.busy, "Launch Game").clicked() {
+                        actions.push(GameAction::LaunchRetroArch);
+                    }
+                    if outline_orange_button(ui, pal, true, "Keybindings & Sensitivity (Live)")
+                        .clicked()
+                    {
+                        actions.push(GameAction::OpenControlsTab);
+                    }
+                    if let Some(states_root) =
+                        game.extra_roots.iter().find(|r| r.id == "savestates")
+                        && ui.button("Open Save States Folder").clicked()
+                    {
+                        actions.push(GameAction::OpenFolder(states_root.path.clone()));
+                    }
+                });
+                ui.small(
+                    egui::RichText::new(format!(
+                        "Tracked Save States: {} file(s){}",
+                        state_files.len(),
+                        if state_files.is_empty() {
+                            ""
+                        } else {
+                            " (backed up & restored together with memory card / SRM saves)"
+                        }
+                    ))
+                    .color(pal.text_3),
+                );
+                for st in state_files.iter().take(10) {
+                    if let Some(name) = st.file_name().and_then(|n| n.to_str()) {
+                        ui.label(
+                            egui::RichText::new(format!("  • {name}"))
+                                .monospace()
+                                .small()
+                                .color(pal.ok_fg),
+                        );
+                    }
+                }
+            });
+            ui.add_space(8.0);
+        }
+
         // Facts.
         egui::Grid::new("overview_facts").num_columns(2).spacing([14.0, 5.0]).show(ui, |ui| {
             ui.label(egui::RichText::new("Last snapshot").color(pal.text_3));
@@ -916,6 +1099,135 @@ impl SaveGameManagerApp {
         }
         if self.available_files_cache.len() > 200 {
             ui.small(format!("...and {} more.", self.available_files_cache.len() - 200));
+        }
+    }
+
+    fn detail_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        pal: &JizihubPalette,
+        game: &GameEntry,
+        actions: &mut Vec<GameAction>,
+    ) {
+        let id = game.id.clone();
+        let Some(mut meta) = game.retroarch.clone() else {
+            glass_frame_2(pal).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.strong("Configure RetroArch Launch & Controls");
+                ui.label(
+                    egui::RichText::new(
+                        "Attach a ROM file so SaveVault can launch this game directly in RetroArch and manage per-game Mouse & Keyboard bindings.",
+                    )
+                    .color(pal.text_2),
+                );
+                if accent_button(ui, pal, true, "Pick ROM File...").clicked() {
+                    actions.push(GameAction::AttachRetroArchRom);
+                }
+            });
+            return;
+        };
+
+        let mut modified = false;
+        let mut discrete_commit = false;
+        let mut toggled_kbm_on = false;
+        let mut status_note: Option<String> = None;
+
+        glass_frame_2(pal).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                render_badge(ui, pal, &meta.core_name, false);
+                if self.running.contains(&id) {
+                    render_badge(ui, pal, "LIVE HOT-RELOAD ACTIVE", true);
+                }
+                if accent_button(ui, pal, !self.busy, "Launch in RetroArch").clicked() {
+                    actions.push(GameAction::LaunchRetroArch);
+                }
+            });
+            ui.add_space(4.0);
+
+            if ui
+                .checkbox(
+                    &mut meta.kbm_enabled,
+                    "Enable Mouse & Keyboard (KBM) Override for this game",
+                )
+                .changed()
+            {
+                if meta.kbm_enabled && !meta.kbm_customized {
+                    meta.kbm_profile = self.config.default_kbm_profile.clone();
+                    meta.kbm_customized = true;
+                }
+                toggled_kbm_on = meta.kbm_enabled;
+                modified = true;
+                discrete_commit = true;
+                status_note = Some(if meta.kbm_enabled {
+                    format!("Enabled KBM override for {} (applied live).", game.name)
+                } else {
+                    format!("Disabled KBM override for {}.", game.name)
+                });
+            }
+
+            ui.small(
+                egui::RichText::new(if self.running.contains(&id) {
+                    "This game is currently running: keybinding and mouse sensitivity edits apply live within ~200 ms without restarting."
+                } else {
+                    "Saved per game. You can edit sensitivity and bindings both before and during gameplay; new games inherit your Default KBM Template from Settings."
+                })
+                .color(if self.running.contains(&id) {
+                    pal.ok_fg
+                } else {
+                    pal.text_3
+                }),
+            );
+
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .button("Reset to Default KBM Template")
+                    .on_hover_text("Overwrite this game's KBM bindings & sensitivity from Settings -> Default KBM Template")
+                    .clicked()
+                {
+                    meta.kbm_profile = self.config.default_kbm_profile.clone();
+                    meta.kbm_customized = true;
+                    modified = true;
+                    discrete_commit = true;
+                    status_note = Some(format!(
+                        "Reset {} KBM profile to your default template.",
+                        game.name
+                    ));
+                }
+                if outline_orange_button(ui, pal, true, "Save Current as Default for New Games")
+                    .on_hover_text("Use this game's current sensitivity and bindings as the default template when enabling KBM on future games")
+                    .clicked()
+                {
+                    actions.push(GameAction::SaveDefaultKbmTemplate(Box::new(
+                        meta.kbm_profile.clone(),
+                    )));
+                }
+            });
+        });
+
+        ui.add_space(6.0);
+        let editor_outcome = render_kbm_profile_editor(
+            ui,
+            pal,
+            &id,
+            Some(&game.name),
+            KbmRebindScope::Game(id.clone()),
+            &mut meta.kbm_profile,
+            &mut self.kbm_rebind,
+        );
+        if editor_outcome.changed {
+            meta.kbm_customized = true;
+            modified = true;
+        }
+
+        if modified || editor_outcome.commit {
+            actions.push(GameAction::UpdateRetroArchMeta {
+                meta: Box::new(meta),
+                commit: discrete_commit || editor_outcome.commit,
+                ensure_bridge: toggled_kbm_on,
+                status_note,
+            });
         }
     }
 

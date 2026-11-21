@@ -1,0 +1,7 @@
+# Grant the logged-in desktop session access to /dev/uinput and input event nodes
+# so `retroarch-mkb-bridge` can translate mouse and keyboard input into a virtual gamepad.
+# Install with:
+#   sudo install -m 644 assets/69-savevault-uinput.rules /etc/udev/rules.d/69-savevault-uinput.rules
+#   sudo udevadm control --reload-rules && sudo udevadm trigger /dev/uinput
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
+KERNEL=="event*", SUBSYSTEM=="input", TAG+="uaccess"

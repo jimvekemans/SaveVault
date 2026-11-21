@@ -85,6 +85,8 @@ pub fn measure_root(path: &Path, include: &[String], exclude: &[String]) -> Root
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectedRoot {
     pub kind: RootKind,
+    pub id_hint: Option<String>,
+    pub label_hint: Option<String>,
     pub path: PathBuf,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
@@ -223,6 +225,8 @@ fn roots_from_db(entry: &DbGame, game: &GameEntry, ctx: &PathContext) -> (Vec<De
         let stats = measure_root(&path, &include, &[]);
         let root = DetectedRoot {
             kind,
+            id_hint: None,
+            label_hint: None,
             path,
             include,
             exclude: Vec::new(),
@@ -291,6 +295,8 @@ fn steam_cloud_root(game: &GameEntry, ctx: &PathContext) -> Option<DetectedRoot>
         if best.as_ref().is_none_or(|b| stats.newest > b.stats.newest) {
             best = Some(DetectedRoot {
                 kind: RootKind::Saves,
+                id_hint: None,
+                label_hint: None,
                 template: tokenize_path(&remote, ctx),
                 path: remote,
                 include: Vec::new(),
@@ -304,6 +310,10 @@ fn steam_cloud_root(game: &GameEntry, ctx: &PathContext) -> Option<DetectedRoot>
 
 /// Detects where `game` keeps its saves on this machine.
 pub fn detect_game(game: &GameEntry, db: Option<&SaveDb>) -> Detection {
+    if game.provider == Provider::RetroArch && game.retroarch.is_some() {
+        return crate::retroarch::detect_retroarch_roots(game);
+    }
+
     let ctx = PathContext::for_game(game);
     let mod_sources = mods::suggest_mod_sources(game, &ctx);
     let db_entry = db.and_then(|d| lookup_db_game(game, d));
@@ -362,6 +372,8 @@ pub fn detect_game(game: &GameEntry, db: Option<&SaveDb>) -> Detection {
             },
             saves: vec![DetectedRoot {
                 kind: RootKind::Saves,
+                id_hint: None,
+                label_hint: None,
                 template: tokenize_path(&best.path, &ctx),
                 path: best.path.clone(),
                 include: Vec::new(),
@@ -402,6 +414,8 @@ pub fn detect_game(game: &GameEntry, db: Option<&SaveDb>) -> Detection {
             },
             saves: vec![DetectedRoot {
                 kind: RootKind::Saves,
+                id_hint: None,
+                label_hint: None,
                 template: tokenize_path(&best.path, &ctx),
                 path: best.path.clone(),
                 include: Vec::new(),
@@ -486,14 +500,25 @@ pub fn apply_detection(game: &mut GameEntry, det: &Detection, include_config: bo
         if roots.iter().any(|r| r.path == extra.path && r.kind == RootKind::Saves) {
             continue;
         }
-        let id = unique_root_id(&roots, "saves");
+        let id = extra
+            .id_hint
+            .as_deref()
+            .filter(|h| *h != crate::models::PRIMARY_ROOT_ID && !roots.iter().any(|r| r.id == *h))
+            .map(str::to_string)
+            .unwrap_or_else(|| unique_root_id(&roots, "saves"));
+        let label = extra
+            .label_hint
+            .clone()
+            .unwrap_or_else(|| {
+                extra
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "More saves".to_string())
+            });
         roots.push(SaveRoot {
             id,
-            label: extra
-                .path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "More saves".to_string()),
+            label,
             kind: RootKind::Saves,
             path: extra.path.clone(),
             include: extra.include.clone(),
@@ -610,6 +635,9 @@ pub fn merge_scan_results(config: &mut AppConfig, scanned: Vec<(GameEntry, Detec
             }
             if existing.mod_sources.is_empty() {
                 existing.mod_sources = found.mod_sources.clone();
+            }
+            if existing.retroarch.is_none() && found.retroarch.is_some() {
+                existing.retroarch = found.retroarch.clone();
             }
 
             let waiting = existing.is_placeholder()
