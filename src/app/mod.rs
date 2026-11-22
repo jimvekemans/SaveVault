@@ -400,6 +400,11 @@ pub struct SaveGameManagerApp {
     first_frame: bool,
     applied_theme: Option<ThemeMode>,
     unpushed: usize,
+    overlay_mode: bool,
+    overlay_compact: bool,
+    overlay_ipc: Option<crate::overlay::OverlayIpcServer>,
+    overlay_hotkey_capturing: Option<u8>,
+    config_mtime: Option<SystemTime>,
     /// Developer aid: capture the window to a PPM file and exit (see `SAVEVAULT_SCREENSHOT`).
     capture: Option<CaptureRequest>,
 }
@@ -504,7 +509,18 @@ fn human_bytes(bytes: u64) -> String {
 impl SaveGameManagerApp {
     /// Initializes the GUI app, loads persisted settings, and starts background services.
     pub fn new(cc: &eframe::CreationContext<'_>, start_minimized: bool) -> Self {
+        Self::new_with_mode(cc, start_minimized, false)
+    }
+
+    /// Initializes either the full desktop GUI (`overlay_mode = false`) or the always-on-top
+    /// in-game screen overlay (`overlay_mode = true`).
+    pub fn new_with_mode(
+        cc: &eframe::CreationContext<'_>,
+        start_minimized: bool,
+        overlay_mode: bool,
+    ) -> Self {
         let config_path = default_config_path();
+        let config_mtime = fs::metadata(&config_path).and_then(|m| m.modified()).ok();
         let (config, load_msg, is_err) = match load_config(&config_path) {
             Ok(cfg) => (cfg, "Ready.".to_string(), false),
             Err(err) => (
@@ -516,7 +532,28 @@ impl SaveGameManagerApp {
 
         theme::apply_jizihub_theme(&cc.egui_ctx, config.theme_mode);
 
-        let selected_game_id = config.games.first().map(|g| g.id.clone());
+        let initial_probes = crate::watcher::probes_for(&config.games);
+        let initial_running = crate::watcher::running_games(
+            &initial_probes,
+            &crate::watcher::ProcessLister::new().cmdlines(),
+        );
+        let selected_game_id = if overlay_mode {
+            initial_running
+                .iter()
+                .next()
+                .cloned()
+                .or_else(|| {
+                    config
+                        .games
+                        .iter()
+                        .filter(|g| !g.is_placeholder())
+                        .max_by_key(|g| g.sync_state.last_played_at.or(g.last_synced_at))
+                        .map(|g| g.id.clone())
+                })
+                .or_else(|| config.games.first().map(|g| g.id.clone()))
+        } else {
+            config.games.first().map(|g| g.id.clone())
+        };
         let custom_minutes_buffer = match config.global_sync_rate {
             SyncRate::EveryMinutes(m) => m.max(1),
             _ => 30,
@@ -578,7 +615,7 @@ impl SaveGameManagerApp {
             settings_highlight: None,
             scroll_to_settings_highlight: false,
             live_states: HashMap::new(),
-            running: BTreeSet::new(),
+            running: initial_running,
             add_game_draft: AddGameDraft::default(),
             import_state,
             save_editor: SaveEditorState::default(),
@@ -605,6 +642,11 @@ impl SaveGameManagerApp {
             first_frame: true,
             applied_theme,
             unpushed: 0,
+            overlay_mode,
+            overlay_compact: overlay_mode,
+            overlay_ipc: None,
+            overlay_hotkey_capturing: None,
+            config_mtime,
             capture: std::env::var_os("SAVEVAULT_SCREENSHOT").map(|p| CaptureRequest {
                 path: PathBuf::from(p),
                 started: Instant::now(),
@@ -647,19 +689,37 @@ impl SaveGameManagerApp {
         app.refresh_selected_game_files();
         app.refresh_cloud_facts();
 
-        // Load (and if allowed refresh) the save location database, then look for games.
-        app.start_db_load();
-        if app.config.onboarding_done {
-            app.pending.push(Pending::Scan);
-            let due = app.startup_ids();
-            if !due.is_empty() {
-                app.pending.push(Pending::Sync {
-                    not_before: Instant::now(),
-                    ids: due,
-                    title: "Startup check".to_string(),
-                });
+        if overlay_mode {
+            app.db = SaveDb::load_from_dir(&default_db_dir())
+                .ok()
+                .flatten()
+                .map(Arc::new);
+            app.db_checked = true;
+            app.refresh_live_states();
+            app.refresh_timeline();
+            let wake_ctx = cc.egui_ctx.clone();
+            app.overlay_ipc = crate::overlay::OverlayIpcServer::start(Box::new(move || {
+                wake_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                wake_ctx.request_repaint();
+            }));
+        } else {
+            if app.config.overlay_enabled {
+                let _ = crate::overlay::sync_os_overlay_hotkey(true, &app.config.overlay_hotkey);
             }
-            app.startup_sync_has_run = true;
+            // Load (and if allowed refresh) the save location database, then look for games.
+            app.start_db_load();
+            if app.config.onboarding_done {
+                app.pending.push(Pending::Scan);
+                let due = app.startup_ids();
+                if !due.is_empty() {
+                    app.pending.push(Pending::Sync {
+                        not_before: Instant::now(),
+                        ids: due,
+                        title: "Startup check".to_string(),
+                    });
+                }
+                app.startup_sync_has_run = true;
+            }
         }
         app
     }
@@ -682,12 +742,46 @@ impl SaveGameManagerApp {
         if let Err(err) = save_config(&self.config_path, &self.config) {
             self.set_status(format!("Failed to save settings: {err}"), true);
         } else {
+            self.config_mtime = fs::metadata(&self.config_path).and_then(|m| m.modified()).ok();
             let _ = crate::retroarch::sync_kbm_registry_for_config(&self.config_path, &self.config);
         }
         if let Some(w) = &self.watcher {
             w.update_config(&self.config);
         }
         self.refresh_cloud_facts();
+    }
+
+    fn check_external_config_reload(&mut self) {
+        if self.busy
+            || self.kbm_dirty_game_id.is_some()
+            || self.kbm_dirty_default
+            || self.kbm_rebind.is_some()
+            || self.overlay_hotkey_capturing.is_some()
+        {
+            return;
+        }
+        let disk_mtime = fs::metadata(&self.config_path).and_then(|m| m.modified()).ok();
+        if disk_mtime.is_some()
+            && disk_mtime != self.config_mtime
+            && let Ok(fresh) = load_config(&self.config_path)
+        {
+            self.config = fresh;
+            self.config_mtime = disk_mtime;
+            if self
+                .selected_game_id
+                .as_deref()
+                .is_none_or(|sel| !self.config.games.iter().any(|g| g.id == sel))
+            {
+                self.selected_game_id = self.config.games.first().map(|g| g.id.clone());
+            }
+            self.invalidate_game_caches();
+            self.refresh_selected_game_files();
+            self.refresh_live_states();
+            self.refresh_cloud_facts();
+            if let Some(w) = &self.watcher {
+                w.update_config(&self.config);
+            }
+        }
     }
 
     fn preview_live_kbm_game(&mut self, game_id: &str) {
@@ -1231,6 +1325,7 @@ impl SaveGameManagerApp {
     }
 
     fn check_periodic_sync(&mut self) {
+        self.check_external_config_reload();
         if self.busy || self.last_periodic_check.elapsed() < Duration::from_secs(10) {
             return;
         }
@@ -1776,6 +1871,7 @@ impl SaveGameManagerApp {
                     }
                 }
 
+                let mut toggle_overlay_clicked = false;
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let protectable: Vec<String> = self
                         .config
@@ -1790,11 +1886,24 @@ impl SaveGameManagerApp {
                     {
                         self.start_sync(protectable, None, "Back up everything".to_string(), false);
                     }
+                    if !self.overlay_mode
+                        && outline_orange_button(ui, pal, true, "Overlay")
+                            .on_hover_text(format!(
+                                "Toggle the in-game screen overlay ({})",
+                                self.config.overlay_hotkey
+                            ))
+                            .clicked()
+                    {
+                        toggle_overlay_clicked = true;
+                    }
                     if self.busy {
                         ui.label(egui::RichText::new(&self.busy_title).small().color(pal.accent_text));
                         ui.spinner();
                     }
                 });
+                if toggle_overlay_clicked && let Err(err) = crate::overlay::toggle_overlay_command() {
+                    self.set_status(format!("Failed to toggle overlay: {err}"), true);
+                }
             });
 
             ui.add_space(4.0);
@@ -1846,6 +1955,159 @@ impl SaveGameManagerApp {
                     .on_hover_text(&self.status_message);
                 });
             });
+        });
+    }
+
+    fn render_overlay_top_bar(&mut self, ui: &mut egui::Ui, pal: &JizihubPalette) {
+        let mut quick_backup: Option<(String, String)> = None;
+        let mut next_selected: Option<String> = None;
+        let mut toggle_compact = false;
+        let mut close_overlay = false;
+
+        glass_frame_3(pal).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let brand = ui.horizontal(|ui| {
+                    paint_logo_mark(ui, pal);
+                    ui.label(egui::RichText::new(APP_NAME).strong().size(15.0).color(pal.text_1));
+                    render_badge(ui, pal, "OVERLAY", true);
+                    render_badge(ui, pal, &self.config.overlay_hotkey, false);
+                });
+                let brand_drag = ui.interact(
+                    brand.response.rect,
+                    ui.scope_id().with("overlay_brand_drag"),
+                    egui::Sense::drag(),
+                );
+                if brand_drag.drag_started_by(egui::PointerButton::Primary) {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+
+                ui.separator();
+
+                let selected_label = match self.selected_game() {
+                    Some(g) if self.running.contains(&g.id) => format!("[PLAYING] {}", g.name),
+                    Some(g) => g.name.clone(),
+                    None => "Select a game...".to_string(),
+                };
+                let mut sorted_games: Vec<(String, String, &'static str, bool)> = self
+                    .config
+                    .games
+                    .iter()
+                    .map(|g| {
+                        (
+                            g.id.clone(),
+                            g.name.clone(),
+                            g.provider.display_name(),
+                            self.running.contains(&g.id),
+                        )
+                    })
+                    .collect();
+                sorted_games.sort_by(|a, b| b.3.cmp(&a.3).then(a.1.to_lowercase().cmp(&b.1.to_lowercase())));
+
+                egui::ComboBox::from_id_salt("overlay_game_selector")
+                    .selected_text(selected_label)
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        for (id, name, provider, is_running) in sorted_games {
+                            let label = if is_running {
+                                format!("[PLAYING] {name}")
+                            } else {
+                                format!("{name} ({provider})")
+                            };
+                            let active = self.selected_game_id.as_deref() == Some(id.as_str());
+                            if ui.selectable_label(active, label).clicked() {
+                                next_selected = Some(id);
+                            }
+                        }
+                    });
+
+                if let Some(game) = self.selected_game()
+                    && !game.is_placeholder()
+                    && accent_button(ui, pal, !self.busy, "Back up now").clicked()
+                {
+                    quick_backup = Some((game.id.clone(), game.name.clone()));
+                }
+
+                let right_reserved = 215.0;
+                let drag_width = (ui.available_width() - right_reserved).max(16.0);
+                let spacer = ui.allocate_response(egui::vec2(drag_width, 26.0), egui::Sense::drag());
+                if spacer.drag_started_by(egui::PointerButton::Primary) {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if outline_orange_button(ui, pal, true, "Hide (Esc)").clicked() {
+                        close_overlay = true;
+                    }
+                    let view_label = if self.overlay_compact {
+                        "Full App View"
+                    } else {
+                        "Compact HUD"
+                    };
+                    if ui.button(view_label).clicked() {
+                        toggle_compact = true;
+                    }
+                });
+            });
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.set_width(ui.available_width());
+                if !self.running.is_empty() {
+                    render_badge(ui, pal, &format!("{} PLAYING", self.running.len()), true);
+                }
+                if self.busy {
+                    ui.spinner();
+                    ui.label(egui::RichText::new(&self.busy_title).small().color(pal.accent_text));
+                }
+                let status_color = if self.is_error_status { pal.error_fg } else { pal.ok_fg };
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(&self.status_message).small().color(status_color))
+                            .truncate(),
+                    )
+                    .on_hover_text(&self.status_message);
+                });
+            });
+        });
+
+        if let Some(id) = next_selected {
+            self.select_game(id);
+        }
+        if let Some((id, name)) = quick_backup {
+            self.start_sync(vec![id], None, format!("Back up {name}"), false);
+        }
+        if toggle_compact {
+            self.overlay_compact = !self.overlay_compact;
+        }
+        if close_overlay {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    fn render_overlay_compact_body(&mut self, ui: &mut egui::Ui, pal: &JizihubPalette) {
+        self.render_warnings_banner(ui, pal);
+        let avail = ui.available_size();
+        glass_frame_1(pal).show(ui, |ui| {
+            ui.set_min_size(egui::vec2((avail.x - 34.0).max(200.0), (avail.y - 34.0).max(160.0)));
+            if self.selected_game().is_some() {
+                self.render_game_detail(ui, pal);
+            } else {
+                ui.heading("No games tracked yet");
+                ui.label(
+                    egui::RichText::new("Scan for installed games or open the full view to add a game.")
+                        .color(pal.text_2),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if accent_button(ui, pal, !self.busy, "Find games now").clicked() {
+                        self.start_scan(false);
+                    }
+                    if ui.button("Full App View").clicked() {
+                        self.overlay_compact = false;
+                    }
+                });
+            }
         });
     }
 
@@ -2084,6 +2346,15 @@ impl SaveGameManagerApp {
 }
 
 impl eframe::App for SaveGameManagerApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if self.overlay_mode {
+            [0.0, 0.0, 0.0, 0.0]
+        } else {
+            let pal = theme::palette(self.config.theme_mode);
+            egui::Rgba::from(pal.bg_canvas).to_array()
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if self.applied_theme != Some(self.config.theme_mode) {
@@ -2104,26 +2375,86 @@ impl eframe::App for SaveGameManagerApp {
         // Keep ticking so delayed work and the watcher are serviced while idle.
         ctx.request_repaint_after(Duration::from_secs(2));
 
+        if self.overlay_mode {
+            if self
+                .overlay_ipc
+                .as_ref()
+                .is_some_and(|ipc| ipc.close_requested())
+            {
+                if !self.busy {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                } else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                }
+            }
+            let capturing = self.kbm_rebind.is_some() || self.overlay_hotkey_capturing.is_some();
+            if !capturing
+                && !ctx.egui_wants_keyboard_input()
+                && (ctx.input(|i| i.key_pressed(egui::Key::Escape))
+                    || crate::overlay::overlay_hotkey_pressed_in_egui(
+                        &ctx,
+                        &self.config.overlay_hotkey,
+                    ))
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+
         let pal = theme::palette(self.config.theme_mode);
 
         egui::CentralPanel::no_frame().show(ui, |ui| {
-            paint_ambient_backdrop(ui, &pal);
+            if self.overlay_mode {
+                let opacity = self.config.overlay_opacity.clamp(0.55, 1.0);
+                let bg_alpha = (opacity * 255.0).round() as u8;
+                let outer_bg = egui::Color32::from_rgba_unmultiplied(
+                    pal.bg_canvas.r(),
+                    pal.bg_canvas.g(),
+                    pal.bg_canvas.b(),
+                    bg_alpha,
+                );
+                egui::Frame::new()
+                    .fill(outer_bg)
+                    .stroke(egui::Stroke::new(1.5, pal.accent_border))
+                    .corner_radius(egui::CornerRadius::same(10))
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_min_size(ui.available_size());
+                        self.render_overlay_top_bar(ui, &pal);
+                        ui.add_space(6.0);
 
-            egui::Frame::new()
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    ui.set_min_size(ui.available_size());
-                    self.render_top_bar(ui, &pal);
-                    ui.add_space(8.0);
+                        if self.overlay_compact {
+                            self.render_overlay_compact_body(ui, &pal);
+                        } else {
+                            self.render_top_bar(ui, &pal);
+                            ui.add_space(8.0);
+                            match self.active_tab {
+                                AppTab::Games => self.render_games_tab(ui, &pal),
+                                AppTab::SaveEditor => self.render_save_editor_tab(ui, &pal),
+                                AppTab::Import => self.render_import_tab(ui, &pal),
+                                AppTab::Logs => self.render_logs_tab(ui, &pal),
+                                AppTab::Settings => self.render_settings_tab(ui, &pal),
+                            }
+                        }
+                    });
+            } else {
+                paint_ambient_backdrop(ui, &pal);
 
-                    match self.active_tab {
-                        AppTab::Games => self.render_games_tab(ui, &pal),
-                        AppTab::SaveEditor => self.render_save_editor_tab(ui, &pal),
-                        AppTab::Import => self.render_import_tab(ui, &pal),
-                        AppTab::Logs => self.render_logs_tab(ui, &pal),
-                        AppTab::Settings => self.render_settings_tab(ui, &pal),
-                    }
-                });
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.set_min_size(ui.available_size());
+                        self.render_top_bar(ui, &pal);
+                        ui.add_space(8.0);
+
+                        match self.active_tab {
+                            AppTab::Games => self.render_games_tab(ui, &pal),
+                            AppTab::SaveEditor => self.render_save_editor_tab(ui, &pal),
+                            AppTab::Import => self.render_import_tab(ui, &pal),
+                            AppTab::Logs => self.render_logs_tab(ui, &pal),
+                            AppTab::Settings => self.render_settings_tab(ui, &pal),
+                        }
+                    });
+            }
         });
 
         self.render_remove_game_prompt(&ctx, &pal);
@@ -2160,5 +2491,34 @@ pub fn run(start_minimized: bool) -> Result<()> {
         Box::new(move |cc| Ok(Box::new(SaveGameManagerApp::new(cc, start_minimized)))),
     )
     .map_err(|e| anyhow::anyhow!("Failed to launch GUI: {e}"))?;
+    Ok(())
+}
+
+/// Opens SaveVault as an always-on-top, translucent in-game screen overlay (`--overlay`).
+pub fn run_overlay() -> Result<()> {
+    crate::autostart::ensure_linux_desktop_integration();
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("SaveVault Overlay")
+            .with_app_id("savevault-overlay")
+            .with_icon(Arc::new(build_app_icon()))
+            .with_always_on_top()
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_inner_size([860.0, 560.0])
+            .with_min_inner_size([640.0, 380.0]),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "SaveVault Overlay",
+        native_options,
+        Box::new(move |cc| {
+            Ok(Box::new(SaveGameManagerApp::new_with_mode(
+                cc, false, true,
+            )))
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to launch overlay GUI: {e}"))?;
     Ok(())
 }

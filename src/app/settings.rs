@@ -316,6 +316,9 @@ impl SaveGameManagerApp {
                 });
 
                 ui.add_space(8.0);
+                self.render_overlay_settings(ui, pal, &mut changed);
+
+                ui.add_space(8.0);
                 self.render_retroarch_default_kbm_settings(ui, pal, &mut changed);
 
                 ui.add_space(8.0);
@@ -950,6 +953,170 @@ impl SaveGameManagerApp {
         }
         if let Some((msg, is_err)) = pending_status {
             self.set_status(msg, is_err);
+        }
+    }
+
+    pub(super) fn render_overlay_settings(
+        &mut self,
+        ui: &mut egui::Ui,
+        pal: &JizihubPalette,
+        changed: &mut bool,
+    ) {
+        let mut sync_overlay_hotkey = false;
+        let mut test_toggle_clicked = false;
+
+        if let Some(mut armed) = self.overlay_hotkey_capturing {
+            match crate::overlay::capture_overlay_hotkey_from_egui(ui.ctx(), &mut armed) {
+                crate::overlay::OverlayCapturePoll::Pending => {
+                    self.overlay_hotkey_capturing = Some(armed);
+                }
+                crate::overlay::OverlayCapturePoll::Captured(combo) => {
+                    self.overlay_hotkey_capturing = None;
+                    self.config.overlay_hotkey = combo;
+                    *changed = true;
+                    if self.config.overlay_enabled {
+                        sync_overlay_hotkey = true;
+                    }
+                }
+                crate::overlay::OverlayCapturePoll::Cancelled => {
+                    self.overlay_hotkey_capturing = None;
+                }
+            }
+        }
+
+        glass_frame_1(pal).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("In-Game Screen Overlay");
+                if self.config.overlay_enabled {
+                    render_badge(ui, pal, "OS HOTKEY ACTIVE", true);
+                } else {
+                    render_badge(ui, pal, "OFF BY DEFAULT", false);
+                }
+            });
+            ui.small(
+                egui::RichText::new(
+                    "Open SaveVault as a translucent always-on-top screen overlay while playing to take quick snapshots, restore saves, or adjust live Controls & KBM settings. The shortcut is registered directly with your operating system so SaveVault does not listen to keyboard input in the background.",
+                )
+                .color(pal.text_3),
+            );
+            ui.add_space(4.0);
+
+            if ui
+                .checkbox(
+                    &mut self.config.overlay_enabled,
+                    "Enable in-game screen overlay hotkey",
+                )
+                .changed()
+            {
+                *changed = true;
+                sync_overlay_hotkey = true;
+            }
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Overlay toggle hotkey:");
+                let is_capturing = self.overlay_hotkey_capturing.is_some();
+                let btn_text = if is_capturing {
+                    "Press key / combo... (Esc)".to_string()
+                } else {
+                    self.config.overlay_hotkey.clone()
+                };
+                let capture_btn = egui::Button::new(
+                    egui::RichText::new(btn_text).monospace().small().color(
+                        if is_capturing {
+                            pal.accent_contrast
+                        } else {
+                            pal.text_1
+                        },
+                    ),
+                )
+                .fill(if is_capturing { pal.accent } else { pal.glass_2 })
+                .stroke(egui::Stroke::new(
+                    1.0,
+                    if is_capturing {
+                        pal.accent
+                    } else {
+                        pal.border_strong
+                    },
+                ))
+                .min_size(egui::vec2(160.0, 24.0));
+                if ui
+                    .add(capture_btn)
+                    .on_hover_text("Click then press any key or modifier combo (e.g. LAlt+LShift+S)")
+                    .clicked()
+                {
+                    self.overlay_hotkey_capturing = if is_capturing { None } else { Some(0) };
+                }
+
+                egui::ComboBox::from_id_salt("overlay_hotkey_presets")
+                    .selected_text("Presets...")
+                    .width(120.0)
+                    .show_ui(ui, |ui| {
+                        for &preset in crate::overlay::OVERLAY_HOTKEY_PRESETS {
+                            let selected = self.config.overlay_hotkey == preset;
+                            if ui.selectable_label(selected, preset).clicked() {
+                                self.config.overlay_hotkey = preset.to_string();
+                                self.overlay_hotkey_capturing = None;
+                                *changed = true;
+                                if self.config.overlay_enabled {
+                                    sync_overlay_hotkey = true;
+                                }
+                            }
+                        }
+                    });
+
+                if ui.button("Reset").clicked() {
+                    self.config.overlay_hotkey = crate::models::default_overlay_hotkey();
+                    self.overlay_hotkey_capturing = None;
+                    *changed = true;
+                    if self.config.overlay_enabled {
+                        sync_overlay_hotkey = true;
+                    }
+                }
+            });
+
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().slider_width = 180.0;
+                ui.label("Overlay opacity:");
+                let mut opacity_pct = (self.config.overlay_opacity * 100.0).round();
+                if ui
+                    .add(
+                        egui::Slider::new(&mut opacity_pct, 55.0..=100.0)
+                            .step_by(1.0)
+                            .suffix("%"),
+                    )
+                    .changed()
+                {
+                    self.config.overlay_opacity = (opacity_pct / 100.0).clamp(0.55, 1.0);
+                    *changed = true;
+                }
+            });
+
+            ui.horizontal_wrapped(|ui| {
+                if outline_orange_button(ui, pal, true, "Test / Toggle Overlay Now").clicked() {
+                    test_toggle_clicked = true;
+                }
+                ui.small(
+                    egui::RichText::new(crate::overlay::describe_os_overlay_status(&self.config))
+                        .color(pal.text_2),
+                );
+            });
+        });
+
+        if sync_overlay_hotkey {
+            match crate::overlay::sync_os_overlay_hotkey(
+                self.config.overlay_enabled,
+                &self.config.overlay_hotkey,
+            ) {
+                Ok(status) => self.set_status(status.message, false),
+                Err(err) => self.set_status(
+                    format!("Saved setting, but OS shortcut registration failed: {err}"),
+                    true,
+                ),
+            }
+        }
+        if test_toggle_clicked && let Err(err) = crate::overlay::toggle_overlay_command() {
+            self.set_status(format!("Failed to toggle overlay: {err}"), true);
         }
     }
 

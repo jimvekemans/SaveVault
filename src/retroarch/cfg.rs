@@ -453,6 +453,7 @@ pub fn game_override_cfg_path(game: &GameEntry) -> Option<PathBuf> {
 fn strip_savevault_override_block(raw: &str) -> Vec<String> {
     let mut kept = Vec::new();
     let mut inside_block = false;
+    let mut inside_legacy = false;
     for line in raw.lines() {
         let trimmed = line.trim();
         if trimmed == BEGIN_OVERRIDE_MARKER {
@@ -461,6 +462,18 @@ fn strip_savevault_override_block(raw: &str) -> Vec<String> {
         }
         if trimmed == END_OVERRIDE_MARKER {
             inside_block = false;
+            continue;
+        }
+        if !inside_block && !inside_legacy && trimmed.starts_with("input_auto_mouse_grab = ")
+            && raw.contains("# Mouse & Keyboard Override Bindings (managed by SaveVault)")
+        {
+            inside_legacy = true;
+            continue;
+        }
+        if inside_legacy {
+            if trimmed == "input_netplay_player_chat = \"nul\"" {
+                inside_legacy = false;
+            }
             continue;
         }
         if !inside_block {

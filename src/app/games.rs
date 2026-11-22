@@ -525,7 +525,7 @@ impl SaveGameManagerApp {
         }
     }
 
-    fn render_game_detail(&mut self, ui: &mut egui::Ui, pal: &JizihubPalette) {
+    pub(super) fn render_game_detail(&mut self, ui: &mut egui::Ui, pal: &JizihubPalette) {
         let Some(game) = self.selected_game().cloned() else {
             ui.label(egui::RichText::new("Pick a game on the left.").color(pal.text_3));
             return;

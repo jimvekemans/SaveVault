@@ -27,6 +27,10 @@ GENERAL:
     -h, --help                        Show this help
     -V, --version                     Show the version
         --minimized                   Open the desktop app minimized (used for autostart)
+        --overlay                     Open SaveVault as an always-on-top in-game screen overlay
+        --toggle-overlay              Toggle the in-game screen overlay on or off (used by the OS hotkey)
+        --enable-overlay [HOTKEY]     Enable the in-game overlay and register its hotkey with the OS
+        --disable-overlay             Disable the in-game overlay and remove its OS hotkey
         --status                      Show settings and every tracked game with its state
 
 DETECTION:
@@ -119,6 +123,10 @@ fn print_status() -> Result<()> {
     println!(
         "Snapshot when a game closes: {} | safety backups: {} (keep {})",
         cfg.backup_on_game_exit, cfg.safety_backups, cfg.safety_backup_keep
+    );
+    println!(
+        "In-game overlay: {}",
+        save_game_manager::overlay::describe_os_overlay_status(&cfg)
     );
     match load_db() {
         Some(db) => println!(
@@ -339,7 +347,35 @@ fn run_cli(args: &[String]) -> Result<bool> {
     match flag {
         "-h" | "--help" => print_help(),
         "-V" | "--version" => println!("SaveVault {}", env!("CARGO_PKG_VERSION")),
-        "--minimized" => return Ok(false),
+        "--minimized" | "--overlay" => return Ok(false),
+        "--toggle-overlay" => {
+            save_game_manager::overlay::toggle_overlay_command()?;
+        }
+        "--enable-overlay" => {
+            let (config_path, mut cfg) = load()?;
+            if let Some(raw_hotkey) = args.get(1) {
+                let normalized = save_game_manager::overlay::normalize_overlay_hotkey(raw_hotkey)
+                    .with_context(|| {
+                        format!(
+                            "Invalid hotkey '{raw_hotkey}'. Examples: LAlt+LShift+S, LCtrl+F10, Super+Grave"
+                        )
+                    })?;
+                cfg.overlay_hotkey = normalized;
+            }
+            cfg.overlay_enabled = true;
+            save_config(&config_path, &cfg)?;
+            let status =
+                save_game_manager::overlay::sync_os_overlay_hotkey(true, &cfg.overlay_hotkey)?;
+            println!("{}", status.message);
+        }
+        "--disable-overlay" => {
+            let (config_path, mut cfg) = load()?;
+            cfg.overlay_enabled = false;
+            save_config(&config_path, &cfg)?;
+            let status =
+                save_game_manager::overlay::sync_os_overlay_hotkey(false, &cfg.overlay_hotkey)?;
+            println!("{}", status.message);
+        }
         "--status" => print_status()?,
         "--scan" => run_scan(false)?,
         "--detect" => run_scan(true)?,
@@ -495,6 +531,11 @@ fn main() -> Result<()> {
     if run_cli(&args)? {
         return Ok(());
     }
-    let minimized = args.first().map(String::as_str) == Some("--minimized");
-    save_game_manager::app::run(minimized)
+    let first = args.first().map(String::as_str);
+    if first == Some("--overlay") {
+        save_game_manager::app::run_overlay()
+    } else {
+        let minimized = first == Some("--minimized");
+        save_game_manager::app::run(minimized)
+    }
 }

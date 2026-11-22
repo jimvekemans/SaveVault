@@ -8,6 +8,7 @@ pub mod git_ops;
 pub mod kbm;
 pub mod logo;
 pub mod models;
+pub mod overlay;
 pub mod pattern;
 pub mod portability;
 pub mod profiles;

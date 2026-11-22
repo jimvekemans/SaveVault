@@ -1,6 +1,6 @@
 use crate::models::{
     AppConfig, AuthMethod, CONFIG_SCHEMA_VERSION, ConflictPolicy, KbmProfile, Platform, Provider,
-    SyncRate, ThemeMode, default_retroarch_binary,
+    SyncRate, ThemeMode, default_overlay_hotkey, default_overlay_opacity, default_retroarch_binary,
 };
 use crate::providers::{default_provider_libraries, scan_provider_libraries};
 use anyhow::{Context, Result};
@@ -59,6 +59,9 @@ pub fn default_config() -> AppConfig {
         ignored_game_ids: Vec::new(),
         default_kbm_profile: KbmProfile::default(),
         retroarch_binary: default_retroarch_binary(),
+        overlay_enabled: false,
+        overlay_hotkey: default_overlay_hotkey(),
+        overlay_opacity: default_overlay_opacity(),
     }
 }
 
@@ -290,6 +293,12 @@ pub fn load_config(path: &Path) -> Result<AppConfig> {
     }
     if cfg.chunk_size_mb == 0 {
         cfg.chunk_size_mb = 45;
+    }
+    if cfg.overlay_hotkey.trim().is_empty() {
+        cfg.overlay_hotkey = default_overlay_hotkey();
+    }
+    if !(0.55..=1.0).contains(&cfg.overlay_opacity) {
+        cfg.overlay_opacity = default_overlay_opacity();
     }
 
     let old_schema = cfg.schema_version;

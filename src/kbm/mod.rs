@@ -240,4 +240,66 @@ mod tests {
         let (rx_off, _) = raw.compute_right_stick(10.0, 0.0);
         assert_ne!(rx_on, rx_off);
     }
+
+    #[test]
+    fn mouse_overhaul_conserves_total_turn_distance_on_fast_large_swipe() {
+        let p = KbmProfile {
+            mouse_sensitivity: 2500.0,
+            mouse_dpi: 800,
+            mouse_deadzone: 0.0,
+            aiming_overhaul_enabled: true,
+            aiming_preset_id: Some("black_ps2".to_string()),
+            ..Default::default()
+        };
+        let preset = resolve_aim_overhaul_preset("Black (Europe)", Some("black_ps2"));
+        let mut med_filt = 0.0_f64;
+        let mut fast_filt = 0.0_f64;
+        let simulated_turn = |u_filt: &mut f64, rx: i32| -> f64 {
+            let u = (rx as f64) / 32767.0;
+            *u_filt = 0.125 * u + 0.875 * *u_filt;
+            let mag = u_filt.abs();
+            if mag <= preset.internal_deadzone_x {
+                0.0
+            } else {
+                let n = (mag - preset.internal_deadzone_x) / (1.0 - preset.internal_deadzone_x);
+                u_filt.signum() * n.powf(preset.response_exponent)
+            }
+        };
+
+        // 1-count micro-movement stays calm (< 34% total stick / ~1.7% game speed, well below old 44% spike).
+        let mut micro = MouseLookState::from_profile_for_game(&p, "Black (Europe)");
+        let (rx_micro, _) = micro.compute_right_stick(1.0, 0.0);
+        assert!(
+            rx_micro < 11200,
+            "expected micro 1-count nudge < 34% total stick (~2% active turn speed), got {rx_micro}"
+        );
+
+        // Compare 800 counts sent slowly/medium (16 counts/tick * 50 ticks) vs fast large swipe
+        // (80 counts/tick * 10 ticks = 800 counts) through Black's 32ms low-pass stick filter.
+        let mut med = MouseLookState::from_profile_for_game(&p, "Black (Europe)");
+        let mut fast = MouseLookState::from_profile_for_game(&p, "Black (Europe)");
+        let mut med_sum = 0.0;
+        let mut fast_sum = 0.0;
+
+        for _ in 0..50 {
+            med_sum += simulated_turn(&mut med_filt, med.compute_right_stick(16.0, 0.0).0);
+        }
+        for _ in 0..60 {
+            med_sum += simulated_turn(&mut med_filt, med.compute_right_stick(0.0, 0.0).0);
+        }
+
+        for _ in 0..10 {
+            fast_sum += simulated_turn(&mut fast_filt, fast.compute_right_stick(80.0, 0.0).0);
+        }
+        for _ in 0..120 {
+            let rx = fast.compute_right_stick(0.0, 0.0).0;
+            fast_sum += simulated_turn(&mut fast_filt, rx);
+        }
+
+        let ratio = fast_sum / med_sum.max(1e-6);
+        assert!(
+            (0.92..=1.08).contains(&ratio),
+            "expected conserved 1:1 turn distance between fast & med (ratio={ratio:.3}, med={med_sum:.3}, fast={fast_sum:.3})"
+        );
+    }
 }

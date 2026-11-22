@@ -808,6 +808,15 @@ pub struct AppConfig {
     /// RetroArch binary name or full path used by the RetroArch game launcher.
     #[serde(default = "default_retroarch_binary")]
     pub retroarch_binary: String,
+    /// Whether the in-game screen overlay & OS global shortcut are enabled (off by default).
+    #[serde(default)]
+    pub overlay_enabled: bool,
+    /// Global hotkey combo registered with the OS to toggle the in-game screen overlay.
+    #[serde(default = "default_overlay_hotkey")]
+    pub overlay_hotkey: String,
+    /// Backdrop opacity (0.55..=1.0) for the in-game screen overlay window.
+    #[serde(default = "default_overlay_opacity")]
+    pub overlay_opacity: f32,
 }
 
 fn default_safety_keep() -> u32 {
@@ -816,6 +825,14 @@ fn default_safety_keep() -> u32 {
 
 pub fn default_retroarch_binary() -> String {
     "retroarch".to_string()
+}
+
+pub fn default_overlay_hotkey() -> String {
+    "LAlt+LShift+S".to_string()
+}
+
+pub fn default_overlay_opacity() -> f32 {
+    0.92
 }
 
 impl AppConfig {
